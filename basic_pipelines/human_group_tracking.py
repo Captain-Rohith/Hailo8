@@ -1,10 +1,15 @@
 """
-Human Group Tracking - With Visual Overlays
-Detects humans, clusters by proximity, shows pan/tilt to center largest group.
-Draws cluster boxes, center markers, and connection line on video.
+Human Group Tracking - With Servo Control
+Detects humans, clusters by proximity, automatically adjusts pan/tilt servos
+to center the largest group in the frame.
+
+Hardware:
+    - Pan servo on GPIO 23
+    - Tilt servo on GPIO 24
 
 Usage:
-    python human_group_tracking.py --input rpi --use-frame
+    python human_group_tracking.py --input rpi
+    python human_group_tracking.py --input rpi --no-servo  # Disable servo control
 """
 
 from pathlib import Path
@@ -17,6 +22,7 @@ import hailo
 import argparse
 import cv2
 import numpy as np
+import time
 
 from hailo_apps.hailo_app_python.core.common.buffer_utils import get_caps_from_pad, get_numpy_from_buffer
 from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_app import app_callback_class
@@ -25,6 +31,276 @@ from hailo_apps.hailo_app_python.apps.detection.detection_pipeline import GStrea
 # Default paths
 DEFAULT_CUSTOM_HEF = "/usr/local/hailo/resources/models/hailo8l/best.hef"
 DEFAULT_LABELS_JSON = str(Path(__file__).resolve().parent.parent / "local_resources" / "best_person.json")
+
+# Servo PCA9685 channels (instead of GPIO pins)
+PAN_CHANNEL = 1  # PCA9685 channel for pan servo
+TILT_CHANNEL = 0  # PCA9685 channel for tilt servo
+
+# Servo parameters
+SERVO_FREQ = 50  # 50Hz for standard servos
+SERVO_MIN_PULSE = 500   # microseconds (0 degrees)
+SERVO_MAX_PULSE = 2500  # microseconds (180 degrees)
+SERVO_CENTER = 1500     # microseconds (90 degrees / center)
+SERVO_INIT = 1500       # Initialize at 90 degrees (center)
+
+# Control parameters
+DEAD_ZONE = 12          # Percentage - don't move if offset is less than this (was 8)
+SPEED_FACTOR = 0.8    # How fast servos respond (0.1 = slow, 1.0 = fast)
+UPDATE_INTERVAL = 0.25  # Seconds between servo updates (was 0.2)
+SMOOTHING = 0.7         # Exponential smoothing (0.9 = very smooth, 0.5 = responsive)
+MIN_PULSE_CHANGE = 15   # Minimum pulse change (us) to actually move servo
+
+# -----------------------------------------------------------------------------------------------
+# Servo Controller using PCA9685 (I2C PWM driver - very stable)
+# -----------------------------------------------------------------------------------------------
+class ServoController:
+    def __init__(self, pan_channel=PAN_CHANNEL, tilt_channel=TILT_CHANNEL, speed=SPEED_FACTOR, 
+                 invert_pan=False, invert_tilt=False, enabled=True):
+        self.pan_channel = pan_channel
+        self.tilt_channel = tilt_channel
+        self.speed = speed
+        self.invert_pan = invert_pan
+        self.invert_tilt = invert_tilt
+        self.enabled = enabled
+        self.pca = None
+        self.pan_servo = None
+        self.tilt_servo = None
+        
+        # Current positions as angle (0-180 degrees, 90 = center)
+        self.pan_angle = 90.0  # Start at center
+        self.tilt_angle = 90.0
+        
+        # Target positions (smoothed)
+        self.pan_target = 90.0
+        self.tilt_target = 90.0
+        
+        # Last sent positions (to avoid redundant updates)
+        self.last_pan_sent = 90.0
+        self.last_tilt_sent = 90.0
+        
+        # Last update time
+        self.last_update = 0
+        
+        # Track if we have active detection
+        self.has_target = False
+        
+        if self.enabled:
+            self._init_pca9685()
+    
+    def _init_pca9685(self):
+        """Initialize PCA9685 servo driver"""
+        try:
+            import board
+            import busio
+            from adafruit_pca9685 import PCA9685
+            from adafruit_motor import servo
+            
+            # Initialize I2C with explicit frequency (lower = more stable)
+            # Default is 100kHz, some PCA9685 boards have issues at high speeds
+            i2c = busio.I2C(board.SCL, board.SDA, frequency=100000)
+            
+            # Retry logic for PCA9685 initialization
+            for attempt in range(3):
+                try:
+                    self.pca = PCA9685(i2c)
+                    self.pca.frequency = SERVO_FREQ
+                    break
+                except Exception as e:
+                    print(f"PCA9685 init attempt {attempt+1} failed: {e}")
+                    time.sleep(0.5)
+                    if attempt == 2:
+                        raise
+            
+            # Create servo objects on specified channels
+            # actuation_range is the total range in degrees
+            # min_pulse and max_pulse in microseconds
+            self.pan_servo = servo.Servo(
+                self.pca.channels[self.pan_channel],
+                min_pulse=SERVO_MIN_PULSE,
+                max_pulse=SERVO_MAX_PULSE,
+                actuation_range=180
+            )
+            self.tilt_servo = servo.Servo(
+                self.pca.channels[self.tilt_channel],
+                min_pulse=SERVO_MIN_PULSE,
+                max_pulse=SERVO_MAX_PULSE,
+                actuation_range=180
+            )
+            
+            # Move to center (90 degrees) with retry
+            self._safe_set_angle(self.pan_servo, 90)
+            self._safe_set_angle(self.tilt_servo, 90)
+            time.sleep(0.5)  # Give servos time to reach position
+            
+            print(f"PCA9685 Servos initialized: Pan=CH{self.pan_channel}, Tilt=CH{self.tilt_channel}")
+            print(f"Servos at 90 degrees (center)")
+            
+        except Exception as e:
+            print(f"Warning: Could not initialize PCA9685: {e}")
+            import traceback
+            traceback.print_exc()
+            self.enabled = False
+            self.pca = None
+            self.pan_servo = None
+            self.tilt_servo = None
+    
+    def _safe_set_angle(self, servo_obj, angle, retries=2):
+        """Set servo angle with retry on I2C errors"""
+        if servo_obj is None:
+            return False
+        
+        angle = max(0, min(180, angle))
+        
+        for attempt in range(retries + 1):
+            try:
+                servo_obj.angle = angle
+                return True
+            except OSError as e:
+                if attempt < retries:
+                    time.sleep(0.01)  # Small delay before retry
+                # Silently fail after retries - don't spam console
+        return False
+    
+    def _set_servo_angle(self, servo_obj, angle):
+        """Set servo position using angle (0-180 degrees)"""
+        if not self.enabled or servo_obj is None:
+            return
+        self._safe_set_angle(servo_obj, angle)
+    
+    def _release_servos(self):
+        """Release servos - keep at current position, just stop updating"""
+        # Don't set angle to None as this can cause I2C issues
+        # Just stop calling update - servos will hold their last position
+        pass
+    
+    def update(self, pan_offset_pct, tilt_offset_pct, has_detection=True):
+        """
+        Update servo positions to CENTER the target in the frame.
+        pan_offset_pct: positive = target is to the RIGHT of frame center
+        tilt_offset_pct: positive = target is BELOW frame center
+        has_detection: if False, servos hold their current position
+        
+        Logic:
+        - Target on RIGHT of frame -> camera must rotate RIGHT -> target moves LEFT toward center
+        - Target on LEFT of frame -> camera must rotate LEFT -> target moves RIGHT toward center
+        - Target BELOW center -> camera must tilt DOWN -> target moves UP toward center
+        - Target ABOVE center -> camera must tilt UP -> target moves DOWN toward center
+        """
+        if not self.enabled:
+            return
+        
+        self.has_target = has_detection
+        
+        # If no detection, hold current position
+        if not has_detection:
+            return
+        
+        # Rate limiting
+        now = time.time()
+        if now - self.last_update < UPDATE_INTERVAL:
+            return
+        self.last_update = now
+        
+        # Store raw offsets for logging
+        raw_pan_offset = pan_offset_pct
+        raw_tilt_offset = tilt_offset_pct
+        
+        # Dead zone - target is in center band, stop moving
+        if abs(pan_offset_pct) < DEAD_ZONE:
+            pan_offset_pct = 0
+        if abs(tilt_offset_pct) < DEAD_ZONE:
+            tilt_offset_pct = 0
+        
+        # If target is centered, hold position
+        if pan_offset_pct == 0 and tilt_offset_pct == 0:
+            print(f"[SERVO] Target in dead zone (pan={raw_pan_offset:+.1f}%, tilt={raw_tilt_offset:+.1f}%) - HOLDING")
+            return
+        
+        # PROPORTIONAL step size - move faster when far, slower when close
+        # This prevents overshoot by slowing down as we approach the target
+        base_step = 0.8  # Minimum step in degrees
+        max_step = 3.0   # Maximum step in degrees
+        
+        # Scale step by how far off-center we are (0-50% range mapped to base-max)
+        pan_magnitude = min(abs(pan_offset_pct), 50) / 50.0  # 0.0 to 1.0
+        tilt_magnitude = min(abs(tilt_offset_pct), 50) / 50.0
+        
+        pan_step = base_step + (max_step - base_step) * pan_magnitude
+        tilt_step = base_step + (max_step - base_step) * tilt_magnitude
+        
+        # Determine direction
+        pan_adjust = 0.0
+        tilt_adjust = 0.0
+        
+        # PAN: Target on RIGHT (+) -> need to turn camera RIGHT to bring target to center
+        #      Assuming: increasing angle = camera turns RIGHT
+        if pan_offset_pct > 0:
+            pan_adjust = pan_step
+        elif pan_offset_pct < 0:
+            pan_adjust = -pan_step
+        
+        # TILT: Target BELOW (+) -> need to tilt camera DOWN to bring target to center
+        #       Assuming: increasing angle = camera tilts DOWN
+        if tilt_offset_pct > 0:
+            tilt_adjust = tilt_step
+        elif tilt_offset_pct < 0:
+            tilt_adjust = -tilt_step
+        
+        # Apply inversion if servo is mounted opposite
+        if self.invert_pan:
+            pan_adjust = -pan_adjust
+        if self.invert_tilt:
+            tilt_adjust = -tilt_adjust
+        
+        # Store old angles for comparison
+        old_pan = self.pan_angle
+        old_tilt = self.tilt_angle
+        
+        # Update angle
+        self.pan_angle = self.pan_angle + pan_adjust
+        self.tilt_angle = self.tilt_angle + tilt_adjust
+        
+        # Clamp to valid range (0-180 degrees)
+        self.pan_angle = max(0, min(180, self.pan_angle))
+        self.tilt_angle = max(0, min(180, self.tilt_angle))
+        
+        # Simplified logging
+        print(f"[SERVO] Target: pan={raw_pan_offset:+.1f}% tilt={raw_tilt_offset:+.1f}% | Step: pan={pan_adjust:+.1f}° tilt={tilt_adjust:+.1f}° | Angle: {old_pan:.0f}°->{self.pan_angle:.0f}° / {old_tilt:.0f}°->{self.tilt_angle:.0f}°")
+        
+        # Send to servos
+        self._set_servo_angle(self.pan_servo, self.pan_angle)
+        self._set_servo_angle(self.tilt_servo, self.tilt_angle)
+        self.last_pan_sent = self.pan_angle
+        self.last_tilt_sent = self.tilt_angle
+    
+    def center(self):
+        """Move servos to center position"""
+        self.pan_angle = 90.0
+        self.tilt_angle = 90.0
+        self.pan_target = 90.0
+        self.tilt_target = 90.0
+        if self.pan_servo:
+            self.pan_servo.angle = 90
+        if self.tilt_servo:
+            self.tilt_servo.angle = 90
+    
+    def cleanup(self):
+        """Cleanup PCA9685 resources"""
+        try:
+            # Release servos
+            if self.pan_servo:
+                self.pan_servo.angle = None
+            if self.tilt_servo:
+                self.tilt_servo.angle = None
+            # Deinit PCA9685
+            if self.pca:
+                self.pca.deinit()
+            print("PCA9685 servos cleaned up")
+        except:
+            pass
+
+# Global servo controller (initialized in main)
+servo_controller = None
 
 # -----------------------------------------------------------------------------------------------
 # Simple distance-based clustering (no sklearn needed)
@@ -82,6 +358,11 @@ class user_app_callback_class(app_callback_class):
         super().__init__()
         self.eps = eps
         self.frame_count = 0
+        
+        # Lock-on tracking state
+        self.locked_group_center = None  # (cx, cy) of locked group
+        self.lock_active = False
+        self.lock_search_radius = 150  # Pixels - how far to search for the locked group
 
 # -----------------------------------------------------------------------------------------------
 # Callback - draws clusters, centers, and pan/tilt on frame
@@ -155,10 +436,65 @@ def app_callback(pad, info, user_data):
             largest_size = len(members)
             largest_id = cid
     
+    # Calculate all group centers
+    group_centers = {}  # cid -> (cx, cy)
+    for cid, members in clusters.items():
+        if len(members) < 2:
+            continue
+        min_x = min_y = float('inf')
+        max_x = max_y = 0
+        for idx in members:
+            bbox = persons[idx].get_bbox()
+            min_x = min(min_x, int(bbox.xmin() * width))
+            min_y = min(min_y, int(bbox.ymin() * height))
+            max_x = max(max_x, int(bbox.xmax() * width))
+            max_y = max(max_y, int(bbox.ymax() * height))
+        group_centers[cid] = ((min_x + max_x) // 2, (min_y + max_y) // 2, len(members))
+    
+    # Lock-on logic: Find group to track
+    target_group_id = None
+    
+    if user_data.lock_active and user_data.locked_group_center is not None:
+        # Find group closest to last locked position
+        best_dist = float('inf')
+        best_cid = None
+        for cid, (cx, cy, size) in group_centers.items():
+            dx = cx - user_data.locked_group_center[0]
+            dy = cy - user_data.locked_group_center[1]
+            dist = (dx*dx + dy*dy) ** 0.5
+            if dist < best_dist and dist < user_data.lock_search_radius:
+                best_dist = dist
+                best_cid = cid
+        
+        if best_cid is not None:
+            target_group_id = best_cid
+            # Update locked position to follow the group
+            user_data.locked_group_center = (group_centers[best_cid][0], group_centers[best_cid][1])
+        else:
+            # Lost the locked group - auto-retarget to largest group
+            print("Lock lost - auto-retargeting to largest group")
+            if largest_id >= 0 and largest_id in group_centers:
+                target_group_id = largest_id
+                user_data.locked_group_center = (group_centers[largest_id][0], group_centers[largest_id][1])
+                print(f"Retargeted to group size: {group_centers[largest_id][2]}")
+            else:
+                # No groups available
+                target_group_id = None
+                user_data.lock_active = False
+                user_data.locked_group_center = None
+    else:
+        # Not locked or no lock - target largest group
+        if largest_id >= 0:
+            target_group_id = largest_id
+            # Auto-lock on first detection
+            if not user_data.lock_active and largest_id in group_centers:
+                user_data.lock_active = True
+                user_data.locked_group_center = (group_centers[largest_id][0], group_centers[largest_id][1])
+    
     # Colors for clusters
     colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
     
-    largest_group_center = None
+    target_group_center = None
     
     if frame is not None:
         # Draw each cluster
@@ -167,6 +503,7 @@ def app_callback(pad, info, user_data):
                 continue
             
             color = colors[cid % len(colors)]
+            is_target = (cid == target_group_id)
             is_largest = (cid == largest_id)
             
             # Calculate cluster bounding box
@@ -187,47 +524,80 @@ def app_callback(pad, info, user_data):
             max_x = min(width, max_x + pad)
             max_y = min(height, max_y + pad)
             
-            # Draw cluster box
-            thickness = 4 if is_largest else 2
-            cv2.rectangle(frame, (min_x, min_y), (max_x, max_y), color, thickness)
+            # Draw cluster box - target gets special color (cyan) and thickness
+            if is_target:
+                box_color = (0, 255, 255)  # Cyan for locked target
+                thickness = 4
+            else:
+                box_color = color
+                thickness = 2
+            cv2.rectangle(frame, (min_x, min_y), (max_x, max_y), box_color, thickness)
             
             # Cluster center
             group_cx = (min_x + max_x) // 2
             group_cy = (min_y + max_y) // 2
             
             # Draw "+" at group center
-            size = 15 if is_largest else 10
-            cv2.line(frame, (group_cx - size, group_cy), (group_cx + size, group_cy), color, 3)
-            cv2.line(frame, (group_cx, group_cy - size), (group_cx, group_cy + size), color, 3)
+            size = 15 if is_target else 10
+            marker_color = (0, 255, 255) if is_target else color
+            cv2.line(frame, (group_cx - size, group_cy), (group_cx + size, group_cy), marker_color, 3)
+            cv2.line(frame, (group_cx, group_cy - size), (group_cx, group_cy + size), marker_color, 3)
             
-            # Label
-            label = f"GROUP {len(members)}" if is_largest else f"grp {len(members)}"
-            cv2.putText(frame, label, (min_x, min_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            # Label - show LOCKED for target, largest for biggest
+            if is_target:
+                label = f"LOCKED ({len(members)})"
+            elif is_largest:
+                label = f"GROUP {len(members)}"
+            else:
+                label = f"grp {len(members)}"
+            cv2.putText(frame, label, (min_x, min_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
             
-            if is_largest:
-                largest_group_center = (group_cx, group_cy)
+            if is_target:
+                target_group_center = (group_cx, group_cy)
         
-        # Draw line from largest group center to frame center
-        if largest_group_center is not None:
-            cv2.line(frame, largest_group_center, (frame_cx, frame_cy), (0, 255, 255), 2)
+        # Draw line from target group center to frame center
+        if target_group_center is not None:
+            cv2.line(frame, target_group_center, (frame_cx, frame_cy), (0, 255, 255), 2)
             
-            # Calculate pan/tilt
-            pan_px = largest_group_center[0] - frame_cx
-            tilt_px = largest_group_center[1] - frame_cy
+            # Calculate pan/tilt percentage
+            pan_px = target_group_center[0] - frame_cx
+            tilt_px = target_group_center[1] - frame_cy
             pan_pct = (pan_px / width) * 100
             tilt_pct = (tilt_px / height) * 100
+            
+            # Update servos to track the group
+            if servo_controller is not None:
+                servo_controller.update(pan_pct, tilt_pct, has_detection=True)
             
             pan_dir = "R" if pan_px > 0 else "L"
             tilt_dir = "D" if tilt_px > 0 else "U"
             
             # Draw pan/tilt info at top
-            info_text = f"Pan: {abs(pan_pct):.0f}% {pan_dir}  Tilt: {abs(tilt_pct):.0f}% {tilt_dir}"
+            lock_status = "LOCKED" if user_data.lock_active else "AUTO"
+            servo_status = "TRACKING" if servo_controller and servo_controller.enabled else "NO SERVO"
+            info_text = f"Pan: {abs(pan_pct):.0f}% {pan_dir}  Tilt: {abs(tilt_pct):.0f}% {tilt_dir}  [{servo_status}]"
             cv2.putText(frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            cv2.putText(frame, f"Persons: {n_persons}  Groups: {len([c for c in clusters.values() if len(c)>=2])}", 
-                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame, f"Persons: {n_persons}  Groups: {len([c for c in clusters.values() if len(c)>=2])}  [{lock_status}] Press 's' to retarget", 
+                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         else:
-            cv2.putText(frame, f"Persons: {n_persons} (no groups)", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            # No target group - tell servos to hold position
+            if servo_controller is not None:
+                servo_controller.update(0, 0, has_detection=False)
+            servo_status = "HOLDING" if servo_controller and servo_controller.enabled else "NO SERVO"
+            lock_status = "LOST" if user_data.lock_active else "NO TARGET"
+            cv2.putText(frame, f"Persons: {n_persons} [{lock_status}] [{servo_status}] Press 's' to retarget", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        # Check for key press (non-blocking)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('s') or key == ord('S'):
+            # Retarget to largest group
+            user_data.lock_active = False
+            user_data.locked_group_center = None
+            if largest_id >= 0 and largest_id in group_centers:
+                user_data.lock_active = True
+                user_data.locked_group_center = (group_centers[largest_id][0], group_centers[largest_id][1])
+                print(f"Retargeted to largest group (size: {group_centers[largest_id][2]})")
         
         # Convert and set frame
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -242,6 +612,20 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Human Group Tracking")
     parser.add_argument('--clustering-eps', type=float, default=100,
                         help='Max distance (pixels) between persons to form a group (default: 100)')
+    parser.add_argument('--no-servo', action='store_true',
+                        help='Disable servo control')
+    parser.add_argument('--pan-channel', type=int, default=0,
+                        help='PCA9685 channel for pan servo (default: 0)')
+    parser.add_argument('--tilt-channel', type=int, default=1,
+                        help='PCA9685 channel for tilt servo (default: 1)')
+    parser.add_argument('--servo-speed', type=float, default=0.5,
+                        help='Servo movement speed 0-1 (default: 0.5)')
+    parser.add_argument('--invert-pan', action='store_true',
+                        help='Invert pan servo direction')
+    parser.add_argument('--invert-tilt', action='store_true',
+                        help='Invert tilt servo direction')
+    parser.add_argument('--swap-servos', action='store_true',
+                        help='Swap pan and tilt servo channels (if wired backwards)')
     args, remaining = parser.parse_known_args()
     return args, remaining
 
@@ -256,10 +640,39 @@ if __name__ == "__main__":
     # Parse our args
     args, remaining = parse_args()
     
+    # Handle servo swap
+    pan_ch = args.pan_channel
+    tilt_ch = args.tilt_channel
+    if args.swap_servos:
+        pan_ch, tilt_ch = tilt_ch, pan_ch
+    
     print("=" * 60)
     print("Human Group Tracking")
     print(f"Clustering distance: {args.clustering_eps} pixels")
+    if not args.no_servo:
+        print(f"PCA9685 Servo control: Pan=CH{pan_ch}, Tilt=CH{tilt_ch}")
+        if args.swap_servos:
+            print("  (channels SWAPPED from default)")
+        print(f"Servo speed: {args.servo_speed}")
+        if args.invert_pan:
+            print("Pan direction: INVERTED")
+        if args.invert_tilt:
+            print("Tilt direction: INVERTED")
+    else:
+        print("Servo control: DISABLED")
     print("=" * 60)
+    
+    # Initialize servo controller (global)
+    if not args.no_servo:
+        servo_controller = ServoController(
+            pan_channel=pan_ch,
+            tilt_channel=tilt_ch,
+            speed=args.servo_speed,
+            invert_pan=args.invert_pan,
+            invert_tilt=args.invert_tilt
+        )
+    else:
+        servo_controller = None
     
     # Rebuild sys.argv for GStreamerDetectionApp
     sys.argv = [sys.argv[0]] + remaining
@@ -282,5 +695,11 @@ if __name__ == "__main__":
     
     # Run
     print("\nStarting... (Ctrl+C to stop)\n")
-    app = GStreamerDetectionApp(app_callback, user_data)
-    app.run()
+    try:
+        app = GStreamerDetectionApp(app_callback, user_data)
+        app.run()
+    finally:
+        # Cleanup servo controller
+        if servo_controller is not None:
+            print("\nCentering servos and cleaning up...")
+            servo_controller.cleanup()
