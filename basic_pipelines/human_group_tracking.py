@@ -23,6 +23,8 @@ import argparse
 import cv2
 import numpy as np
 import time
+import threading
+import select
 
 from hailo_apps.hailo_app_python.core.common.buffer_utils import get_caps_from_pad, get_numpy_from_buffer
 from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_app import app_callback_class
@@ -35,6 +37,7 @@ DEFAULT_LABELS_JSON = str(Path(__file__).resolve().parent.parent / "local_resour
 # Servo PCA9685 channels (instead of GPIO pins)
 PAN_CHANNEL = 1  # PCA9685 channel for pan servo
 TILT_CHANNEL = 0  # PCA9685 channel for tilt servo
+FOCUS_CHANNEL = 2  # PCA9685 channel for focus servo (manual control)
 
 # Servo parameters
 SERVO_FREQ = 50  # 50Hz for standard servos
@@ -54,10 +57,11 @@ MIN_PULSE_CHANGE = 15   # Minimum pulse change (us) to actually move servo
 # Servo Controller using PCA9685 (I2C PWM driver - very stable)
 # -----------------------------------------------------------------------------------------------
 class ServoController:
-    def __init__(self, pan_channel=PAN_CHANNEL, tilt_channel=TILT_CHANNEL, speed=SPEED_FACTOR, 
-                 invert_pan=False, invert_tilt=False, enabled=True):
+    def __init__(self, pan_channel=PAN_CHANNEL, tilt_channel=TILT_CHANNEL, focus_channel=FOCUS_CHANNEL,
+                 speed=SPEED_FACTOR, invert_pan=False, invert_tilt=False, enabled=True):
         self.pan_channel = pan_channel
         self.tilt_channel = tilt_channel
+        self.focus_channel = focus_channel
         self.speed = speed
         self.invert_pan = invert_pan
         self.invert_tilt = invert_tilt
@@ -65,10 +69,12 @@ class ServoController:
         self.pca = None
         self.pan_servo = None
         self.tilt_servo = None
+        self.focus_servo = None
         
         # Current positions as angle (0-180 degrees, 90 = center)
         self.pan_angle = 90.0  # Start at center
         self.tilt_angle = 90.0
+        self.focus_angle = 180.0  # Focus starts at center (0-360 range)
         
         # Target positions (smoothed)
         self.pan_target = 90.0
@@ -126,13 +132,20 @@ class ServoController:
                 max_pulse=SERVO_MAX_PULSE,
                 actuation_range=180
             )
+            self.focus_servo = servo.Servo(
+                self.pca.channels[self.focus_channel],
+                min_pulse=SERVO_MIN_PULSE,
+                max_pulse=SERVO_MAX_PULSE,
+                actuation_range=360  # 360 degree range for focus
+            )
             
-            # Move to center (90 degrees) with retry
-            self._safe_set_angle(self.pan_servo, 90)
-            self._safe_set_angle(self.tilt_servo, 90)
+            # Move to center with retry
+            self._safe_set_angle(self.pan_servo, 90)   # Pan center = 90
+            self._safe_set_angle(self.tilt_servo, 90)  # Tilt center = 90
+            self._safe_set_angle(self.focus_servo, 180) # Focus center = 180 (middle of 0-360)
             time.sleep(0.5)  # Give servos time to reach position
             
-            print(f"PCA9685 Servos initialized: Pan=CH{self.pan_channel}, Tilt=CH{self.tilt_channel}")
+            print(f"PCA9685 Servos initialized: Pan=CH{self.pan_channel}, Tilt=CH{self.tilt_channel}, Focus=CH{self.focus_channel}")
             print(f"Servos at 90 degrees (center)")
             
         except Exception as e:
@@ -273,6 +286,22 @@ class ServoController:
         self.last_pan_sent = self.pan_angle
         self.last_tilt_sent = self.tilt_angle
     
+    def adjust_focus(self, direction):
+        """
+        Manually adjust focus servo.
+        direction: +1 for increase (up arrow), -1 for decrease (down arrow)
+        """
+        if not self.enabled or self.focus_servo is None:
+            return
+        
+        step = 5.0  # Degrees per key press (larger for 360 range)
+        old_focus = self.focus_angle
+        self.focus_angle = self.focus_angle + (direction * step)
+        self.focus_angle = max(0, min(360, self.focus_angle))  # 0-360 range
+        
+        self._set_servo_angle(self.focus_servo, self.focus_angle)
+        print(f"[FOCUS] {old_focus:.0f}° -> {self.focus_angle:.0f}° ({'UP' if direction > 0 else 'DOWN'})")
+    
     def center(self):
         """Move servos to center position"""
         self.pan_angle = 90.0
@@ -292,6 +321,8 @@ class ServoController:
                 self.pan_servo.angle = None
             if self.tilt_servo:
                 self.tilt_servo.angle = None
+            if self.focus_servo:
+                self.focus_servo.angle = None
             # Deinit PCA9685
             if self.pca:
                 self.pca.deinit()
@@ -363,6 +394,46 @@ class user_app_callback_class(app_callback_class):
         self.locked_group_center = None  # (cx, cy) of locked group
         self.lock_active = False
         self.lock_search_radius = 150  # Pixels - how far to search for the locked group
+        self.frame_height = 720  # Will be updated
+
+# Focus slider dimensions (will be set based on frame size)
+FOCUS_SLIDER_X = 20
+FOCUS_SLIDER_Y = 50  # From bottom
+FOCUS_SLIDER_WIDTH = 200
+FOCUS_SLIDER_HEIGHT = 25
+
+def draw_focus_slider(frame, focus_angle, height):
+    """Draw a focus control slider bar on the frame"""
+    if servo_controller is None or not servo_controller.enabled:
+        return
+    
+    # Slider position (bottom left)
+    x = FOCUS_SLIDER_X
+    y = height - FOCUS_SLIDER_Y
+    w = FOCUS_SLIDER_WIDTH
+    h = FOCUS_SLIDER_HEIGHT
+    
+    # Background bar (dark gray)
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (50, 50, 50), -1)
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (150, 150, 150), 2)
+    
+    # Fill based on focus angle (0-360)
+    fill_width = int((focus_angle / 360.0) * (w - 4))
+    cv2.rectangle(frame, (x + 2, y + 2), (x + 2 + fill_width, y + h - 2), (0, 200, 255), -1)
+    
+    # Slider knob
+    knob_x = x + 2 + fill_width
+    cv2.rectangle(frame, (knob_x - 3, y), (knob_x + 3, y + h), (255, 255, 255), -1)
+    
+    # Label
+    cv2.putText(frame, f"FOCUS: {focus_angle:.0f}", (x, y - 8), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+    cv2.putText(frame, "0", (x, y + h + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+    cv2.putText(frame, "360", (x + w - 25, y + h + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+    
+    # Instructions
+    cv2.putText(frame, "W/X keys = focus", (x + w + 10, y + 15), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
 
 # -----------------------------------------------------------------------------------------------
 # Callback - draws clusters, centers, and pan/tilt on frame
@@ -378,6 +449,9 @@ def app_callback(pad, info, user_data):
     fmt, width, height = get_caps_from_pad(pad)
     if width is None:
         width, height = 1280, 720
+    
+    # Store height for mouse callback
+    user_data.frame_height = height
     
     # Get frame for drawing (only if use_frame is enabled)
     frame = None
@@ -589,8 +663,11 @@ def app_callback(pad, info, user_data):
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         
         # Check for key press (non-blocking)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('s') or key == ord('S'):
+        # Use full key code for arrow keys (don't mask with 0xFF)
+        key = cv2.waitKey(1)
+        key_masked = key & 0xFF
+        
+        if key_masked == ord('s') or key_masked == ord('S'):
             # Retarget to largest group
             user_data.lock_active = False
             user_data.locked_group_center = None
@@ -598,12 +675,85 @@ def app_callback(pad, info, user_data):
                 user_data.lock_active = True
                 user_data.locked_group_center = (group_centers[largest_id][0], group_centers[largest_id][1])
                 print(f"Retargeted to largest group (size: {group_centers[largest_id][2]})")
+        # Focus control: Arrow keys OR w/e keys
+        # Arrow key codes vary by platform - common values:
+        # Linux GTK: Up=65362, Down=65364
+        # Linux Qt: Up=16777235, Down=16777237
+        # Also accept 'w' for up, 'e' for down as reliable fallback
+        elif key == 65362 or key == 16777235 or key_masked == ord('w') or key_masked == ord('W'):
+            if servo_controller is not None:
+                servo_controller.adjust_focus(+1)
+        elif key == 65364 or key == 16777237 or key_masked == ord('x') or key_masked == ord('X'):
+            if servo_controller is not None:
+                servo_controller.adjust_focus(-1)
+        
+        # Draw focus slider bar on frame
+        if servo_controller is not None and servo_controller.enabled:
+            draw_focus_slider(frame, servo_controller.focus_angle, height)
         
         # Convert and set frame
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         user_data.set_frame(frame)
     
     return Gst.PadProbeReturn.OK
+
+# -----------------------------------------------------------------------------------------------
+# Keyboard listener for terminal input (works without GUI focus)
+# -----------------------------------------------------------------------------------------------
+class KeyboardListener:
+    """Listen for keyboard input from terminal in a separate thread"""
+    def __init__(self, servo_ctrl):
+        self.servo_ctrl = servo_ctrl
+        self.running = False
+        self.thread = None
+    
+    def start(self):
+        """Start the keyboard listener thread"""
+        self.running = True
+        self.thread = threading.Thread(target=self._listen, daemon=True)
+        self.thread.start()
+        print("\n[KEYBOARD] Listening for keys: W=focus up, X=focus down, S=retarget, Q=quit")
+    
+    def stop(self):
+        """Stop the keyboard listener"""
+        self.running = False
+    
+    def _listen(self):
+        """Listen for keyboard input"""
+        import termios
+        import tty
+        
+        # Save terminal settings
+        old_settings = termios.tcgetattr(sys.stdin)
+        
+        try:
+            # Set terminal to raw mode
+            tty.setcbreak(sys.stdin.fileno())
+            
+            while self.running:
+                # Check if input is available (non-blocking)
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    char = sys.stdin.read(1)
+                    
+                    if char.lower() == 'w':
+                        if self.servo_ctrl:
+                            self.servo_ctrl.adjust_focus(+1)
+                    elif char.lower() == 'x':
+                        if self.servo_ctrl:
+                            self.servo_ctrl.adjust_focus(-1)
+                    elif char.lower() == 's':
+                        print("[KEY] Retarget requested (press in video window)")
+                    elif char.lower() == 'q':
+                        print("[KEY] Quit requested")
+                        os._exit(0)
+        except Exception as e:
+            print(f"[KEYBOARD] Error: {e}")
+        finally:
+            # Restore terminal settings
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+# Global keyboard listener
+keyboard_listener = None
 
 # -----------------------------------------------------------------------------------------------
 # Argument parsing
@@ -618,6 +768,8 @@ def parse_args():
                         help='PCA9685 channel for pan servo (default: 0)')
     parser.add_argument('--tilt-channel', type=int, default=1,
                         help='PCA9685 channel for tilt servo (default: 1)')
+    parser.add_argument('--focus-channel', type=int, default=2,
+                        help='PCA9685 channel for focus servo (default: 2)')
     parser.add_argument('--servo-speed', type=float, default=0.5,
                         help='Servo movement speed 0-1 (default: 0.5)')
     parser.add_argument('--invert-pan', action='store_true',
@@ -650,14 +802,15 @@ if __name__ == "__main__":
     print("Human Group Tracking")
     print(f"Clustering distance: {args.clustering_eps} pixels")
     if not args.no_servo:
-        print(f"PCA9685 Servo control: Pan=CH{pan_ch}, Tilt=CH{tilt_ch}")
+        print(f"PCA9685 Servo control: Pan=CH{pan_ch}, Tilt=CH{tilt_ch}, Focus=CH{args.focus_channel}")
         if args.swap_servos:
-            print("  (channels SWAPPED from default)")
+            print("  (Pan/Tilt channels SWAPPED from default)")
         print(f"Servo speed: {args.servo_speed}")
         if args.invert_pan:
             print("Pan direction: INVERTED")
         if args.invert_tilt:
             print("Tilt direction: INVERTED")
+        print("Focus: Use UP/DOWN arrow keys to adjust")
     else:
         print("Servo control: DISABLED")
     print("=" * 60)
@@ -667,12 +820,19 @@ if __name__ == "__main__":
         servo_controller = ServoController(
             pan_channel=pan_ch,
             tilt_channel=tilt_ch,
+            focus_channel=args.focus_channel,
             speed=args.servo_speed,
             invert_pan=args.invert_pan,
             invert_tilt=args.invert_tilt
         )
     else:
         servo_controller = None
+    
+    # Start keyboard listener for focus control
+    keyboard_listener = None
+    if servo_controller is not None:
+        keyboard_listener = KeyboardListener(servo_controller)
+        keyboard_listener.start()
     
     # Rebuild sys.argv for GStreamerDetectionApp
     sys.argv = [sys.argv[0]] + remaining
@@ -699,6 +859,9 @@ if __name__ == "__main__":
         app = GStreamerDetectionApp(app_callback, user_data)
         app.run()
     finally:
+        # Stop keyboard listener
+        if keyboard_listener is not None:
+            keyboard_listener.stop()
         # Cleanup servo controller
         if servo_controller is not None:
             print("\nCentering servos and cleaning up...")

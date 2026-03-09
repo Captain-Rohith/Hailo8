@@ -1,0 +1,228 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  pdftitle={Servo Control Project Documentation},
+  pdfauthor={Project Team}
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible
+}
+
+\title{Servo Control Project Documentation\\\large Raspberry Pi 5 + PCA9685 + Continuous Servo}
+\author{Project Repository: \texttt{hailo-rpi5-examples}}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Document Scope}
+This document describes the servo-control subsystem implemented in:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{servo\_test/test\_focus.py}
+\end{itemize}
+within the repository \texttt{hailo-rpi5-examples}. It focuses on terminal-based control of a 360-degree (continuous rotation) servo using a PCA9685 PWM driver connected to Raspberry Pi 5 GPIO I2C pins.
+
+\section{Project Overview}
+\subsection{Purpose}
+Provide a low-latency, terminal-driven test utility to:
+\begin{itemize}[leftmargin=*]
+  \item Drive continuous servo speed and direction.
+  \item Calibrate neutral pulse width to stop unwanted drift/spin.
+  \item Validate PCA9685 channel behavior and servo response.
+\end{itemize}
+
+\subsection{Current Status}
+The control script uses direct pulse-width output (microseconds) instead of high-level continuous-servo abstractions to improve neutral calibration accuracy.
+
+\section{System Architecture}
+\subsection{Signal Chain}
+\begin{enumerate}[leftmargin=*]
+  \item User presses key in terminal.
+  \item Script parses key input in raw TTY mode.
+  \item Script computes target pulse width in microseconds.
+  \item Pulse converted to PCA9685 16-bit duty cycle.
+  \item PCA9685 outputs PWM on selected channel.
+  \item Continuous servo rotates according to PWM pulse width.
+\end{enumerate}
+
+\subsection{Control Model}
+Let:
+\begin{itemize}[leftmargin=*]
+  \item $n$ = neutral pulse width (\textmu s)
+  \item $r$ = speed range (\textmu s)
+  \item $s \in [-1,1]$ = normalized speed command
+\end{itemize}
+Then:
+\[
+\text{pulse\_us} = \mathrm{clamp}(n + s\cdot r,\ \text{min\_pulse\_us},\ \text{max\_pulse\_us})
+\]
+
+Duty cycle conversion at frequency $f$:
+\[
+\text{duty\_cycle} = \left\lfloor \frac{\text{pulse\_us}}{1{,}000{,}000/f} \cdot 65535 \right\rfloor
+\]
+
+\section{Technical Specifications}
+\subsection{Hardware Specifications (Known)}
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.30\textwidth} p{0.62\textwidth}}
+\toprule
+\textbf{Item} & \textbf{Specification} \\
+\midrule
+Host board & Raspberry Pi 5 \\
+PWM driver & PCA9685, 16 channels, 12-bit PWM, I2C interface \\
+Servo type & Continuous rotation (360\textdegree) servo \\
+I2C bus pins & Raspberry Pi GPIO I2C pins via \texttt{board.SCL}/\texttt{board.SDA} \\
+Target PWM frequency & 50 Hz \\
+Default channel (script) & 9 (configurable 0--15) \\
+\bottomrule
+\end{longtable}
+
+\subsection{Software Specifications (Known)}
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.30\textwidth} p{0.62\textwidth}}
+\toprule
+\textbf{Item} & \textbf{Specification} \\
+\midrule
+Language & Python 3 \\
+Primary module & \texttt{servo\_test/test\_focus.py} \\
+Key libraries & \texttt{board}, \texttt{busio}, \texttt{adafruit\_pca9685} \\
+Terminal input mode & Raw TTY using \texttt{termios}/\texttt{tty} \\
+Key parsing & Escape sequence parsing for arrow keys, with fallback keys \\
+\bottomrule
+\end{longtable}
+
+\subsection{Default Runtime Parameters (from code)}
+\begin{longtable}{>{\ttfamily\raggedright\arraybackslash}p{0.30\textwidth} >{\raggedright\arraybackslash}p{0.18\textwidth} p{0.44\textwidth}}
+\toprule
+\textbf{Argument} & \textbf{Default} & \textbf{Description} \\
+\midrule
+--channel & 9 & PCA9685 output channel (0--15) \\
+--step & 0.08 & Speed increment per key event \\
+--min-pulse-us & 1000 & Minimum pulse clamp \\
+--max-pulse-us & 2000 & Maximum pulse clamp \\
+--neutral-us & 1500 & Neutral stop pulse \\
+--speed-range-us & 250 & Pulse deviation at full speed \\
+--neutral-step-us & 2 & Neutral tuning increment for \texttt{[}/\texttt{]} \\
+\bottomrule
+\end{longtable}
+
+\section{User Interface and Control Mapping}
+\subsection{Keyboard Controls}
+\begin{longtable}{>{\ttfamily\raggedright\arraybackslash}p{0.25\textwidth} p{0.67\textwidth}}
+\toprule
+\textbf{Key} & \textbf{Action} \\
+\midrule
+UP/RIGHT, w/d & Increase clockwise command \\
+DOWN/LEFT, x/a & Increase counter-clockwise command \\
+SPACE, s & Force speed command to zero \\
+r & Reverse current command sign \\
+[ / ] & Decrease/increase neutral pulse \\
+- / = & Decrease/increase speed range \\
+p & Print/apply current tuning state \\
+q & Quit \\
+\bottomrule
+\end{longtable}
+
+\section{Build and Execution}
+\subsection{Dependencies}
+Install the Python package used by this script:
+\begin{lstlisting}[language=bash]
+pip install adafruit-circuitpython-pca9685
+\end{lstlisting}
+
+\subsection{Run Command}
+\begin{lstlisting}[language=bash]
+python3 servo_test/test_focus.py --channel 9
+\end{lstlisting}
+
+\subsection{Calibration Workflow}
+\begin{enumerate}[leftmargin=*]
+  \item Start script and ensure servo is connected to target PCA9685 channel.
+  \item Press \texttt{SPACE} to set speed command to zero.
+  \item Adjust \texttt{[} and \texttt{]} until servo fully stops.
+  \item Note reported neutral value (\texttt{Neutral=...us}).
+  \item Re-run with fixed neutral:
+\end{enumerate}
+\begin{lstlisting}[language=bash]
+python3 servo_test/test_focus.py --channel 3 --neutral-us <value>
+\end{lstlisting}
+
+\section{Troubleshooting Notes}
+\subsection{Observed Field Issue}
+A specific servo was reported to spin continuously across multiple PCA9685 channels while another servo behaved correctly on the same setup. This strongly indicates a servo-specific issue (internal controller fault, trim drift, or wiring at servo lead) rather than a single PCA9685 channel software problem.
+
+\subsection{Recommended Isolation Test}
+\begin{enumerate}[leftmargin=*]
+  \item Use same PCA9685 channel and same cable, swapping only the servo.
+  \item Compare behavior at identical neutral pulse.
+  \item If only one servo fails, replace or physically trim-calibrate that servo.
+\end{enumerate}
+
+\section{Limitations}
+\begin{itemize}[leftmargin=*]
+  \item Continuous servos do not have position feedback; control is speed/direction only.
+  \item Neutral pulse is unit-specific and may drift with voltage/load/temperature.
+  \item PCA9685 may hold last PWM state until explicitly changed or power-cycled.
+\end{itemize}
+
+\section{Safety and Operating Guidance}
+\begin{itemize}[leftmargin=*]
+  \item Keep load removed during initial calibration.
+  \item Use a stable external servo power rail with shared ground to PCA9685/RPi.
+  \item Avoid stalling servo at high command for extended periods.
+  \item Keep emergency stop command (SPACE) readily accessible.
+\end{itemize}
+
+\section{Assumed Default Specifications}
+The following values are assumed defaults to complete this version of the document:
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.34\textwidth} p{0.58\textwidth}}
+\toprule
+\textbf{Item} & \textbf{Assumed Default} \\
+\midrule
+Continuous servo model & Generic 360\textdegree\ micro servo (SG90-compatible control interface) \\
+Servo operating voltage & 5.0 V nominal \\
+Servo current budget & 1.0 A peak allocation per servo \\
+Servo power source & External regulated 5 V rail (not from Raspberry Pi 5 logic rail) \\
+Ground topology & Common ground between Raspberry Pi 5, PCA9685, and servo power supply \\
+PCA9685 channels used & Channel 1 (known-good servo), Channel 3 (test/fault servo), others available for validation \\
+Neutral pulse (initial) & 1500 \textmu s, calibrated per-servo in software \\
+Pulse limits & 1000--2000 \textmu s (expand to 500--2500 \textmu s if required) \\
+Control frequency & 50 Hz \\
+Mechanical load & Light duty test load (no hard stall at startup) \\
+Performance acceptance & Stable stop at zero-speed command after neutral calibration; no uncontrolled spin under neutral command \\
+Deployment platform & Raspberry Pi 5 with Python 3 and CircuitPython PCA9685 stack \\
+\bottomrule
+\end{longtable}
+
+These defaults should be replaced with measured hardware values and project-specific requirements for production release.
+
+\section{Repository References}
+\begin{itemize}[leftmargin=*]
+  \item \texttt{README.md}
+  \item \texttt{doc/basic-pipelines.md}
+  \item \texttt{servo\_test/test\_focus.py}
+  \item \texttt{setup\_env.sh}
+  \item \texttt{requirements.txt}
+\end{itemize}
+
+\end{document}
